@@ -32,7 +32,13 @@ MAIN_MENU_URL = os.getenv("MAIN_MENU_URL", "https://t.me/YourMainChannel")
 BACKUP_CHANNEL_ID_RAW = os.getenv("BACKUP_CHANNEL_ID", "").strip()
 BACKUP_CHANNEL_ID: Optional[int] = int(BACKUP_CHANNEL_ID_RAW) if BACKUP_CHANNEL_ID_RAW else None
 
-PRODUCTS_FILE = Path("products.json")
+from pathlib import Path
+import os
+
+DATA_DIR = Path("/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+PRODUCTS_FILE = DATA_DIR / "products.json"
 
 # How long to keep recent forwarded/sent messages in memory
 RECENT_CACHE_SECONDS = 60 * 30  # 30 minutes
