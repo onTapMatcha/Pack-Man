@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import re
+import time
 from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -25,13 +27,15 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8015883196"))
 MAIN_MENU_URL = os.getenv("MAIN_MENU_URL", "https://t.me/YourMainChannel")
 
-# Optional backup channel
+# Optional backup channel ID
 # Example: -1001234567890
 BACKUP_CHANNEL_ID_RAW = os.getenv("BACKUP_CHANNEL_ID", "").strip()
 BACKUP_CHANNEL_ID: Optional[int] = int(BACKUP_CHANNEL_ID_RAW) if BACKUP_CHANNEL_ID_RAW else None
 
 PRODUCTS_FILE = Path("products.json")
-ALBUM_FLUSH_SECONDS = 1.5
+
+# How long to keep recent forwarded/sent messages in memory
+RECENT_CACHE_SECONDS = 60 * 30  # 30 minutes
 
 # =========================================================
 # LOGGING
@@ -44,7 +48,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =========================================================
-# DEFAULT STORAGE
+# STORAGE
 # =========================================================
 
 DEFAULT_PRODUCTS: Dict[str, Dict[str, Any]] = {}
@@ -52,35 +56,34 @@ DEFAULT_PRODUCTS: Dict[str, Dict[str, Any]] = {}
 WELCOME_TEXT = f"""
 <b>Welcome</b>
 
-Open a product link from the channel to view its media, price, and details.
+Open a product link from the channel to view the saved product.
 
 <a href="{escape(MAIN_MENU_URL, quote=True)}">Back to Menu</a>
 """.strip()
 
 ADMIN_HELP = """
-<b>Admin Commands</b>
+<b>Admin Flow</b>
 
-1) Send or forward a product photo/video or a whole album to this bot
-2) Then save it with:
+1. Post your product in the backup channel exactly how you want it
+2. Forward that post or album to this bot
+3. Reply to one of the forwarded messages with:
 
-<code>/save slug | Product Name | $Price | Description</code>
-
-Example:
-<code>/save bluecart | Blue Cart | $25 | Smooth pull\\nLimited stock</code>
+<code>/save slug</code>
 
 Optional custom back link:
-<code>/save bluecart | Blue Cart | $25 | Smooth pull\\nLimited stock | https://t.me/YourChannel</code>
+<code>/save slug | https://t.me/YourChannel</code>
 
-Other commands:
-<code>/previewdraft</code> - preview the current unsaved draft
-<code>/listproducts</code> - list saved products
-<code>/deleteproduct slug</code> - delete a saved product
-<code>/menu</code> - show clickable product links
+You can also send media directly to the bot instead of using the backup channel.
+If you do that, the bot will use the local copy it received.
+
+<b>Commands</b>
+<code>/menu</code>
+<code>/listproducts</code>
+<code>/deleteproduct slug</code>
+<code>/preview slug</code>
+<code>/help</code>
 """.strip()
 
-# =========================================================
-# FILE STORAGE
-# =========================================================
 
 def load_products() -> Dict[str, Dict[str, Any]]:
     if not PRODUCTS_FILE.exists():
@@ -124,109 +127,80 @@ def get_products(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, Any]
 
 
 def get_admin_state(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
-    """
-    Stores:
-      current_draft: latest completed draft album/single media for admin
-      pending_albums: temporary incoming album buffer
-    """
     if "admin_state" not in context.application.bot_data:
         context.application.bot_data["admin_state"] = {
-            "current_draft": None,
-            "pending_albums": {},
+            "recent_items": []
         }
     return context.application.bot_data["admin_state"]
 
 
-def build_caption(product: Dict[str, Any]) -> str:
-    name = escape(str(product["name"]))
-    price = escape(str(product["price"]))
-    description = escape(str(product["description"]))
-    back_url = escape(str(product.get("back_url", MAIN_MENU_URL)), quote=True)
-
-    caption = (
-        f"<b>{name}</b>\n"
-        f"Price: {price}\n\n"
-        f"{description}\n\n"
-        f'<a href="{back_url}">Back to Menu</a>'
-    )
-
-    if len(caption) > 1000:
-        caption = caption[:980] + "..."
-
-    return caption
+def prune_recent_items(context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = get_admin_state(context)
+    now = time.time()
+    state["recent_items"] = [
+        item for item in state["recent_items"]
+        if now - item["timestamp"] <= RECENT_CACHE_SECONDS
+    ]
 
 
-def build_backup_caption(product: Dict[str, Any], slug: str) -> str:
-    name = escape(str(product["name"]))
-    price = escape(str(product["price"]))
-    description = escape(str(product["description"]))
-    back_url = escape(str(product.get("back_url", MAIN_MENU_URL)), quote=True)
-    safe_slug = escape(slug)
+def safe_get_message_html(message) -> str:
+    # Preserve caption/text formatting as closely as possible.
+    if getattr(message, "caption", None):
+        html = getattr(message, "caption_html_urled", None)
+        if html:
+            return html
+        return escape(message.caption)
 
-    caption = (
-        f"<b>{name}</b>\n"
-        f"Price: {price}\n\n"
-        f"{description}\n\n"
-        f"ID: {safe_slug}\n"
-        f'<a href="{back_url}">Back to Menu</a>'
-    )
+    if getattr(message, "text", None):
+        html = getattr(message, "text_html_urled", None)
+        if html:
+            return html
+        return escape(message.text)
 
-    if len(caption) > 1000:
-        caption = caption[:980] + "..."
-
-    return caption
+    return ""
 
 
-def build_media_group(product: Dict[str, Any]) -> List[Any]:
-    media_items = product.get("media", [])
-    caption = build_caption(product)
-    output = []
+def guess_display_name_from_html(html_text: str, slug: str) -> str:
+    # Basic HTML tag strip for first-line preview
+    plain = re.sub(r"<[^>]+>", "", html_text or "").strip()
+    if not plain:
+        return slug
 
-    for index, item in enumerate(media_items):
-        media_type = item["type"]
-        media_file = item["file_id"]
-
-        kwargs = {}
-        if index == 0:
-            kwargs["caption"] = caption
-            kwargs["parse_mode"] = ParseMode.HTML
-
-        if media_type == "photo":
-            output.append(InputMediaPhoto(media=media_file, **kwargs))
-        elif media_type == "video":
-            output.append(InputMediaVideo(media=media_file, **kwargs))
-        else:
-            raise ValueError(f"Unsupported media type: {media_type}")
-
-    return output
+    first_line = plain.splitlines()[0].strip()
+    return first_line[:80] if first_line else slug
 
 
-def build_backup_media_group(product: Dict[str, Any], slug: str) -> List[Any]:
-    media_items = product.get("media", [])
-    caption = build_backup_caption(product, slug)
-    output = []
+def parse_save_command(text: str) -> Optional[Dict[str, str]]:
+    """
+    Accepted:
+      /save slug
+      /save slug | back_url
+    """
+    raw = text.strip()
+    if not raw.lower().startswith("/save"):
+        return None
 
-    for index, item in enumerate(media_items):
-        media_type = item["type"]
-        media_file = item["file_id"]
+    rest = raw[5:].strip()
+    if not rest:
+        return None
 
-        kwargs = {}
-        if index == 0:
-            kwargs["caption"] = caption
-            kwargs["parse_mode"] = ParseMode.HTML
+    parts = [p.strip() for p in rest.split("|")]
+    slug = parts[0].lower().replace(" ", "").replace("/", "").replace("\\", "")
 
-        if media_type == "photo":
-            output.append(InputMediaPhoto(media=media_file, **kwargs))
-        elif media_type == "video":
-            output.append(InputMediaVideo(media=media_file, **kwargs))
-        else:
-            raise ValueError(f"Unsupported media type: {media_type}")
+    if not slug:
+        return None
 
-    return output
+    back_url = MAIN_MENU_URL
+    if len(parts) >= 2 and parts[1]:
+        back_url = parts[1]
+
+    return {
+        "slug": slug,
+        "back_url": back_url,
+    }
 
 
-def extract_media_from_message(update: Update) -> Optional[Dict[str, str]]:
-    message = update.effective_message
+def extract_media_from_message(message) -> Optional[Dict[str, str]]:
     if not message:
         return None
 
@@ -239,146 +213,61 @@ def extract_media_from_message(update: Update) -> Optional[Dict[str, str]]:
     return None
 
 
-def parse_save_command(text: str) -> Optional[Dict[str, str]]:
+def extract_forward_source(message) -> Dict[str, Any]:
     """
-    Expected:
-      /save slug | Product Name | $Price | Description
-      /save slug | Product Name | $Price | Description | back_url
+    If admin forwarded a channel post to the bot, try to capture the original source chat/message id.
     """
-    raw = text.strip()
-    if not raw.lower().startswith("/save"):
-        return None
-
-    rest = raw[5:].strip()
-    if not rest:
-        return None
-
-    parts = [p.strip() for p in rest.split("|")]
-    if len(parts) < 4:
-        return None
-
-    slug = parts[0].lower().replace(" ", "").replace("/", "").replace("\\", "")
-    name = parts[1]
-    price = parts[2]
-    description = parts[3]
-    back_url = parts[4] if len(parts) >= 5 and parts[4] else MAIN_MENU_URL
-
-    if not slug:
-        return None
-
-    return {
-        "slug": slug,
-        "name": name,
-        "price": price,
-        "description": description,
-        "back_url": back_url,
+    result = {
+        "source_chat_id": None,
+        "source_message_id": None,
     }
 
+    origin = getattr(message, "forward_origin", None)
+    if not origin:
+        return result
 
-async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, product_key: str) -> None:
-    products = get_products(context)
-    product = products.get(product_key)
+    chat = getattr(origin, "chat", None)
+    message_id = getattr(origin, "message_id", None)
 
-    if not product:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "<b>Product not found.</b>\n\n"
-                f'<a href="{escape(MAIN_MENU_URL, quote=True)}">Back to Menu</a>'
-            ),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        return
+    if chat and getattr(chat, "id", None) is not None and message_id is not None:
+        result["source_chat_id"] = chat.id
+        result["source_message_id"] = message_id
 
-    media = product.get("media", [])
-    if not media:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=build_caption(product),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        return
-
-    try:
-        await context.bot.send_media_group(
-            chat_id=chat_id,
-            media=build_media_group(product),
-        )
-    except Exception as e:
-        logger.exception("Failed to send media group for %s: %s", product_key, e)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=build_caption(product),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    return result
 
 
-async def mirror_product_to_backup_channel(
-    context: ContextTypes.DEFAULT_TYPE,
-    slug: str,
-    product: Dict[str, Any],
-) -> None:
-    if not BACKUP_CHANNEL_ID:
-        return
+def build_local_media_group(product: Dict[str, Any]) -> List[Any]:
+    media_items = product.get("media", [])
+    caption_html = product.get("content_html", "")
+    output = []
 
-    media = product.get("media", [])
-    if not media:
-        await context.bot.send_message(
-            chat_id=BACKUP_CHANNEL_ID,
-            text=build_backup_caption(product, slug),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        return
+    for index, item in enumerate(media_items):
+        kwargs = {}
+        if index == 0 and caption_html:
+            kwargs["caption"] = caption_html
+            kwargs["parse_mode"] = ParseMode.HTML
 
-    await context.bot.send_media_group(
-        chat_id=BACKUP_CHANNEL_ID,
-        media=build_backup_media_group(product, slug),
-    )
+        if item["type"] == "photo":
+            output.append(InputMediaPhoto(media=item["file_id"], **kwargs))
+        elif item["type"] == "video":
+            output.append(InputMediaVideo(media=item["file_id"], **kwargs))
+        else:
+            raise ValueError(f"Unsupported media type: {item['type']}")
+
+    return output
 
 
-# =========================================================
-# ALBUM COLLECTION
-# =========================================================
-
-async def flush_album_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job_data = context.job.data
-    media_group_id = job_data["media_group_id"]
-
-    admin_state = get_admin_state(context)
-    pending_albums = admin_state["pending_albums"]
-    draft = pending_albums.pop(media_group_id, None)
-
-    if not draft:
-        return
-
-    items = draft.get("items", [])
-    if not items:
-        return
-
-    admin_state["current_draft"] = {
-        "media": items,
-        "source_media_group_id": media_group_id,
-    }
-
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=(
-            f"<b>Draft captured.</b>\n"
-            f"Items: {len(items)}\n\n"
-            f"Now send:\n"
-            f"<code>/save slug | Product Name | $Price | Description</code>\n\n"
-            f"Or preview it with:\n"
-            f"<code>/previewdraft</code>"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
+def add_back_link_html(back_url: str) -> str:
+    return f'<a href="{escape(back_url, quote=True)}">Back to Menu</a>'
 
 
-async def capture_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def build_local_text_with_back_link(content_html: str, back_url: str) -> str:
+    if content_html:
+        return f"{content_html}\n\n{add_back_link_html(back_url)}"
+    return add_back_link_html(back_url)
+
+
+def record_recent_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_private_chat(update) or not is_admin(update):
         return
 
@@ -386,48 +275,138 @@ async def capture_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not message:
         return
 
-    media_item = extract_media_from_message(update)
-    if not media_item:
+    media = extract_media_from_message(message)
+    has_text = bool(getattr(message, "text", None))
+    if not media and not has_text:
         return
 
-    admin_state = get_admin_state(context)
+    source = extract_forward_source(message)
+    html_text = safe_get_message_html(message)
 
-    if message.media_group_id:
-        pending_albums = admin_state["pending_albums"]
-        group_id = message.media_group_id
+    state = get_admin_state(context)
+    prune_recent_items(context)
 
-        if group_id not in pending_albums:
-            pending_albums[group_id] = {"items": []}
+    state["recent_items"].append({
+        "timestamp": time.time(),
+        "chat_id": update.effective_chat.id,
+        "local_message_id": message.message_id,
+        "media_group_id": message.media_group_id,
+        "media": media,
+        "html_text": html_text,
+        "source_chat_id": source["source_chat_id"],
+        "source_message_id": source["source_message_id"],
+    })
 
-        pending_albums[group_id]["items"].append(media_item)
 
-        job_name = f"flush_album_{group_id}"
-        current_jobs = context.job_queue.get_jobs_by_name(job_name)
-        for job in current_jobs:
-            job.schedule_removal()
+def get_recent_item_by_message_id(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+) -> Optional[Dict[str, Any]]:
+    state = get_admin_state(context)
+    prune_recent_items(context)
 
-        context.job_queue.run_once(
-            flush_album_job,
-            when=ALBUM_FLUSH_SECONDS,
-            name=job_name,
-            data={"media_group_id": group_id},
+    for item in reversed(state["recent_items"]):
+        if item["chat_id"] == chat_id and item["local_message_id"] == message_id:
+            return item
+    return None
+
+
+def get_group_items_for_reference(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    ref_item: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    media_group_id = ref_item.get("media_group_id")
+    if not media_group_id:
+        return [ref_item]
+
+    state = get_admin_state(context)
+    prune_recent_items(context)
+
+    items = [
+        item for item in state["recent_items"]
+        if item["chat_id"] == chat_id and item.get("media_group_id") == media_group_id
+    ]
+    items.sort(key=lambda x: x["local_message_id"])
+    return items
+
+
+async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: str) -> None:
+    products = get_products(context)
+    product = products.get(slug)
+
+    if not product:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "<b>Product not found.</b>\n\n"
+                f'{add_back_link_html(MAIN_MENU_URL)}'
+            ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
         return
 
-    admin_state["current_draft"] = {
-        "media": [media_item],
-        "source_media_group_id": None,
-    }
+    back_url = product.get("back_url", MAIN_MENU_URL)
 
-    await message.reply_text(
-        (
-            "<b>Draft captured.</b>\n\n"
-            "Now send:\n"
-            "<code>/save slug | Product Name | $Price | Description</code>\n\n"
-            "Or preview it with:\n"
-            "<code>/previewdraft</code>"
-        ),
+    # Preferred mode: copy directly from the original backup-channel/source messages
+    source_chat_id = product.get("source_chat_id")
+    source_message_ids = product.get("source_message_ids") or []
+
+    if source_chat_id and source_message_ids:
+        try:
+            if len(source_message_ids) == 1:
+                await context.bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_ids[0],
+                )
+            else:
+                await context.bot.copy_messages(
+                    chat_id=chat_id,
+                    from_chat_id=source_chat_id,
+                    message_ids=sorted(source_message_ids),
+                )
+
+            # Optional separate menu link after the copied content
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=add_back_link_html(back_url),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+
+        except Exception as e:
+            logger.exception("Source-copy failed for %s: %s", slug, e)
+
+    # Fallback mode: rebuild from stored local file_ids/content
+    media = product.get("media", [])
+    content_html = product.get("content_html", "")
+
+    if media:
+        try:
+            await context.bot.send_media_group(
+                chat_id=chat_id,
+                media=build_local_media_group(product),
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=add_back_link_html(back_url),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as e:
+            logger.exception("Fallback media send failed for %s: %s", slug, e)
+
+    # Final text fallback
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=build_local_text_with_back_link(content_html, back_url),
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
@@ -457,6 +436,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if is_private_chat(update) and is_admin(update):
+        await update.effective_message.reply_text(
+            ADMIN_HELP,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    else:
+        await update.effective_message.reply_text("Use /menu or open a product deep link.")
+
+
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_chat:
         return
@@ -472,10 +462,11 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         for slug, product in products.items():
             deep_link = f"https://t.me/{bot_username}?start={slug}"
-            lines.append(f'• <a href="{deep_link}">{escape(str(product["name"]))}</a>')
+            display_name = escape(str(product.get("display_name", slug)))
+            lines.append(f'• <a href="{deep_link}">{display_name}</a>')
 
     lines.append("")
-    lines.append(f'<a href="{escape(MAIN_MENU_URL, quote=True)}">Back to Main Page</a>')
+    lines.append(add_back_link_html(MAIN_MENU_URL))
 
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
@@ -483,35 +474,6 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
-
-
-async def preview_draft_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_private_chat(update) or not is_admin(update):
-        return
-
-    admin_state = get_admin_state(context)
-    draft = admin_state.get("current_draft")
-
-    if not draft or not draft.get("media"):
-        await update.effective_message.reply_text("No current draft.")
-        return
-
-    preview_product = {
-        "name": "Draft Preview",
-        "price": "$0",
-        "description": "This is just the current unsaved draft.",
-        "back_url": MAIN_MENU_URL,
-        "media": draft["media"],
-    }
-
-    try:
-        await context.bot.send_media_group(
-            chat_id=update.effective_chat.id,
-            media=build_media_group(preview_product),
-        )
-    except Exception as e:
-        logger.exception("Preview draft failed: %s", e)
-        await update.effective_message.reply_text("Failed to preview draft.")
 
 
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -526,57 +488,126 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not parsed:
         await message.reply_text(
             (
-                "Bad format.\n\n"
-                "Use:\n"
-                "/save slug | Product Name | $Price | Description\n\n"
+                "Use this by replying to a forwarded or sent product message:\n\n"
+                "/save slug\n\n"
                 "Optional:\n"
-                "/save slug | Product Name | $Price | Description | back_url"
+                "/save slug | https://t.me/YourChannel"
             )
         )
         return
 
-    admin_state = get_admin_state(context)
-    draft = admin_state.get("current_draft")
-
-    if not draft or not draft.get("media"):
+    if not message.reply_to_message:
         await message.reply_text(
-            "No draft captured yet. Send or forward a photo/video or album to the bot first."
+            "Reply to one of the forwarded product messages with /save slug"
         )
         return
 
-    products = get_products(context)
+    reply = message.reply_to_message
+    ref_item = get_recent_item_by_message_id(
+        context,
+        chat_id=update.effective_chat.id,
+        message_id=reply.message_id,
+    )
+
+    if not ref_item:
+        # Build best-effort single item from the replied message directly
+        direct_media = extract_media_from_message(reply)
+        direct_html = safe_get_message_html(reply)
+        direct_source = extract_forward_source(reply)
+
+        if not direct_media and not getattr(reply, "text", None):
+            await message.reply_text(
+                "I couldn't use that replied message. Reply to a product media/text message."
+            )
+            return
+
+        ref_item = {
+            "chat_id": update.effective_chat.id,
+            "local_message_id": reply.message_id,
+            "media_group_id": reply.media_group_id,
+            "media": direct_media,
+            "html_text": direct_html,
+            "source_chat_id": direct_source["source_chat_id"],
+            "source_message_id": direct_source["source_message_id"],
+        }
+
+    grouped_items = get_group_items_for_reference(
+        context,
+        chat_id=update.effective_chat.id,
+        ref_item=ref_item,
+    )
+
     slug = parsed["slug"]
+    back_url = parsed["back_url"]
 
-    product = {
-        "name": parsed["name"],
-        "price": parsed["price"],
-        "description": parsed["description"],
-        "back_url": parsed["back_url"],
-        "media": draft["media"],
+    # Preserve original caption/text exactly as forwarded/sent
+    content_html = ""
+    for item in grouped_items:
+        if item.get("html_text"):
+            content_html = item["html_text"]
+            break
+
+    local_media: List[Dict[str, str]] = []
+    source_chat_ids = set()
+    source_message_ids: List[int] = []
+
+    for item in grouped_items:
+        if item.get("media"):
+            local_media.append(item["media"])
+
+        if item.get("source_chat_id") is not None and item.get("source_message_id") is not None:
+            source_chat_ids.add(item["source_chat_id"])
+            source_message_ids.append(int(item["source_message_id"]))
+
+    source_chat_id: Optional[int] = None
+    if len(source_chat_ids) == 1 and len(source_message_ids) == len(grouped_items):
+        source_chat_id = next(iter(source_chat_ids))
+        source_message_ids = sorted(set(source_message_ids))
+    else:
+        source_message_ids = []
+
+    display_name = guess_display_name_from_html(content_html, slug)
+
+    products = get_products(context)
+    products[slug] = {
+        "display_name": display_name,
+        "back_url": back_url,
+        "content_html": content_html,
+        "media": local_media,
+        "source_chat_id": source_chat_id,
+        "source_message_ids": source_message_ids,
     }
-
-    products[slug] = product
     save_products(products)
-
-    backup_note = ""
-    if BACKUP_CHANNEL_ID:
-        try:
-            await mirror_product_to_backup_channel(context, slug, product)
-            backup_note = "\nBacked up to backup channel."
-        except Exception as e:
-            logger.exception("Backup mirror failed for %s: %s", slug, e)
-            backup_note = "\nSaved locally, but backup channel mirror failed."
 
     bot_username = (await context.bot.get_me()).username
 
+    source_note = "Uses backup/source copy mode." if source_chat_id and source_message_ids else "Uses local fallback mode."
+
     await message.reply_text(
         (
-            f"Saved product: {slug}\n\n"
+            f"Saved product: {slug}\n"
+            f"{source_note}\n\n"
             f"Deep link:\n"
             f"https://t.me/{bot_username}?start={slug}"
-            f"{backup_note}"
         )
     )
+
+
+async def preview_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_private_chat(update) or not is_admin(update):
+        return
+
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text("Use: /preview slug")
+        return
+
+    slug = parts[1].strip().lower()
+    await send_product(update.effective_chat.id, context, slug)
 
 
 async def list_products_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -590,7 +621,9 @@ async def list_products_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     lines = ["Saved products:\n"]
     for slug, product in products.items():
-        lines.append(f"• {slug} -> {product['name']}")
+        display_name = product.get("display_name", slug)
+        mode = "source" if product.get("source_chat_id") and product.get("source_message_ids") else "local"
+        lines.append(f"• {slug} -> {display_name} ({mode})")
 
     await update.effective_message.reply_text("\n".join(lines))
 
@@ -620,11 +653,24 @@ async def delete_product_command(update: Update, context: ContextTypes.DEFAULT_T
     await message.reply_text(f"Deleted product: {slug}")
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if is_private_chat(update) and is_admin(update):
-        await update.effective_message.reply_text(ADMIN_HELP, parse_mode=ParseMode.HTML)
-    else:
-        await update.effective_message.reply_text("Use /menu or open a product deep link.")
+# =========================================================
+# MESSAGE CAPTURE
+# =========================================================
+
+async def capture_admin_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_private_chat(update) or not is_admin(update):
+        return
+
+    record_recent_item(update, context)
+
+    message = update.effective_message
+    if not message:
+        return
+
+    media = extract_media_from_message(message)
+    if media or getattr(message, "text", None):
+        # Keep this lightweight. No reply spam for every album item.
+        pass
 
 
 # =========================================================
@@ -638,17 +684,19 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("menu", menu_command))
-    application.add_handler(CommandHandler("previewdraft", preview_draft_command))
     application.add_handler(CommandHandler("save", save_command))
+    application.add_handler(CommandHandler("preview", preview_command))
     application.add_handler(CommandHandler("listproducts", list_products_command))
     application.add_handler(CommandHandler("deleteproduct", delete_product_command))
-    application.add_handler(CommandHandler("help", help_command))
 
     application.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE & filters.User(user_id=ADMIN_ID) & (filters.PHOTO | filters.VIDEO),
-            capture_media,
+            filters.ChatType.PRIVATE
+            & filters.User(user_id=ADMIN_ID)
+            & (filters.PHOTO | filters.VIDEO | filters.TEXT),
+            capture_admin_content,
         )
     )
 
