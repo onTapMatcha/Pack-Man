@@ -22,17 +22,15 @@ from telegram.ext import (
 # =========================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
-
-# Your Telegram numeric user ID
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8015883196"))
-
-# Main channel / menu link
 MAIN_MENU_URL = os.getenv("MAIN_MENU_URL", "https://t.me/YourMainChannel")
 
-# Where products get stored
-PRODUCTS_FILE = Path("products.json")
+# Optional backup channel
+# Example: -1001234567890
+BACKUP_CHANNEL_ID_RAW = os.getenv("BACKUP_CHANNEL_ID", "").strip()
+BACKUP_CHANNEL_ID: Optional[int] = int(BACKUP_CHANNEL_ID_RAW) if BACKUP_CHANNEL_ID_RAW else None
 
-# Delay used to collect all items from one incoming album
+PRODUCTS_FILE = Path("products.json")
 ALBUM_FLUSH_SECONDS = 1.5
 
 # =========================================================
@@ -79,7 +77,6 @@ Other commands:
 <code>/deleteproduct slug</code> - delete a saved product
 <code>/menu</code> - show clickable product links
 """.strip()
-
 
 # =========================================================
 # FILE STORAGE
@@ -141,10 +138,10 @@ def get_admin_state(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
 
 
 def build_caption(product: Dict[str, Any]) -> str:
-    name = escape(product["name"])
-    price = escape(product["price"])
-    description = escape(product["description"])
-    back_url = escape(product.get("back_url", MAIN_MENU_URL), quote=True)
+    name = escape(str(product["name"]))
+    price = escape(str(product["price"]))
+    description = escape(str(product["description"]))
+    back_url = escape(str(product.get("back_url", MAIN_MENU_URL)), quote=True)
 
     caption = (
         f"<b>{name}</b>\n"
@@ -153,8 +150,27 @@ def build_caption(product: Dict[str, Any]) -> str:
         f'<a href="{back_url}">Back to Menu</a>'
     )
 
-    # Telegram media captions are limited in size.
-    # Keep a little room for safety.
+    if len(caption) > 1000:
+        caption = caption[:980] + "..."
+
+    return caption
+
+
+def build_backup_caption(product: Dict[str, Any], slug: str) -> str:
+    name = escape(str(product["name"]))
+    price = escape(str(product["price"]))
+    description = escape(str(product["description"]))
+    back_url = escape(str(product.get("back_url", MAIN_MENU_URL)), quote=True)
+    safe_slug = escape(slug)
+
+    caption = (
+        f"<b>{name}</b>\n"
+        f"Price: {price}\n\n"
+        f"{description}\n\n"
+        f"ID: {safe_slug}\n"
+        f'<a href="{back_url}">Back to Menu</a>'
+    )
+
     if len(caption) > 1000:
         caption = caption[:980] + "..."
 
@@ -185,13 +201,36 @@ def build_media_group(product: Dict[str, Any]) -> List[Any]:
     return output
 
 
+def build_backup_media_group(product: Dict[str, Any], slug: str) -> List[Any]:
+    media_items = product.get("media", [])
+    caption = build_backup_caption(product, slug)
+    output = []
+
+    for index, item in enumerate(media_items):
+        media_type = item["type"]
+        media_file = item["file_id"]
+
+        kwargs = {}
+        if index == 0:
+            kwargs["caption"] = caption
+            kwargs["parse_mode"] = ParseMode.HTML
+
+        if media_type == "photo":
+            output.append(InputMediaPhoto(media=media_file, **kwargs))
+        elif media_type == "video":
+            output.append(InputMediaVideo(media=media_file, **kwargs))
+        else:
+            raise ValueError(f"Unsupported media type: {media_type}")
+
+    return output
+
+
 def extract_media_from_message(update: Update) -> Optional[Dict[str, str]]:
     message = update.effective_message
     if not message:
         return None
 
     if message.photo:
-        # Largest size is usually the last one
         return {"type": "photo", "file_id": message.photo[-1].file_id}
 
     if message.video:
@@ -277,6 +316,30 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, product
         )
 
 
+async def mirror_product_to_backup_channel(
+    context: ContextTypes.DEFAULT_TYPE,
+    slug: str,
+    product: Dict[str, Any],
+) -> None:
+    if not BACKUP_CHANNEL_ID:
+        return
+
+    media = product.get("media", [])
+    if not media:
+        await context.bot.send_message(
+            chat_id=BACKUP_CHANNEL_ID,
+            text=build_backup_caption(product, slug),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    await context.bot.send_media_group(
+        chat_id=BACKUP_CHANNEL_ID,
+        media=build_backup_media_group(product, slug),
+    )
+
+
 # =========================================================
 # ALBUM COLLECTION
 # =========================================================
@@ -329,7 +392,6 @@ async def capture_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     admin_state = get_admin_state(context)
 
-    # Album
     if message.media_group_id:
         pending_albums = admin_state["pending_albums"]
         group_id = message.media_group_id
@@ -339,7 +401,6 @@ async def capture_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         pending_albums[group_id]["items"].append(media_item)
 
-        # Reset debounce timer for this album
         job_name = f"flush_album_{group_id}"
         current_jobs = context.job_queue.get_jobs_by_name(job_name)
         for job in current_jobs:
@@ -353,7 +414,6 @@ async def capture_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # Single media message
     admin_state["current_draft"] = {
         "media": [media_item],
         "source_media_group_id": None,
@@ -412,7 +472,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         for slug, product in products.items():
             deep_link = f"https://t.me/{bot_username}?start={slug}"
-            lines.append(f'• <a href="{deep_link}">{escape(product["name"])}</a>')
+            lines.append(f'• <a href="{deep_link}">{escape(str(product["name"]))}</a>')
 
     lines.append("")
     lines.append(f'<a href="{escape(MAIN_MENU_URL, quote=True)}">Back to Main Page</a>')
@@ -487,7 +547,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     products = get_products(context)
     slug = parsed["slug"]
 
-    products[slug] = {
+    product = {
         "name": parsed["name"],
         "price": parsed["price"],
         "description": parsed["description"],
@@ -495,13 +555,26 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "media": draft["media"],
     }
 
+    products[slug] = product
     save_products(products)
+
+    backup_note = ""
+    if BACKUP_CHANNEL_ID:
+        try:
+            await mirror_product_to_backup_channel(context, slug, product)
+            backup_note = "\nBacked up to backup channel."
+        except Exception as e:
+            logger.exception("Backup mirror failed for %s: %s", slug, e)
+            backup_note = "\nSaved locally, but backup channel mirror failed."
+
+    bot_username = (await context.bot.get_me()).username
 
     await message.reply_text(
         (
             f"Saved product: {slug}\n\n"
             f"Deep link:\n"
-            f"https://t.me/{(await context.bot.get_me()).username}?start={slug}"
+            f"https://t.me/{bot_username}?start={slug}"
+            f"{backup_note}"
         )
     )
 
