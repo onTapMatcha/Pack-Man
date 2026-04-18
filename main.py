@@ -27,20 +27,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8015883196"))
 MAIN_MENU_URL = os.getenv("MAIN_MENU_URL", "https://t.me/YourMainChannel")
 
-# Optional backup channel ID
-# Example: -1001234567890
-BACKUP_CHANNEL_ID_RAW = os.getenv("BACKUP_CHANNEL_ID", "").strip()
-BACKUP_CHANNEL_ID: Optional[int] = int(BACKUP_CHANNEL_ID_RAW) if BACKUP_CHANNEL_ID_RAW else None
-
-from pathlib import Path
-import os
-
-DATA_DIR = Path("/data")
+# Railway volume mount path
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 PRODUCTS_FILE = DATA_DIR / "products.json"
 
-# How long to keep recent forwarded/sent messages in memory
+# How long to keep recently sent/forwarded admin messages in memory
 RECENT_CACHE_SECONDS = 60 * 30  # 30 minutes
 
 # =========================================================
@@ -70,17 +63,15 @@ Open a product link from the channel to view the saved product.
 ADMIN_HELP = """
 <b>Admin Flow</b>
 
-1. Post your product in the backup channel exactly how you want it
-2. Forward that post or album to this bot
-3. Reply to one of the forwarded messages with:
+1. Send or forward a product post or album to this bot
+2. Reply to one of those messages with:
 
 <code>/save slug</code>
 
 Optional custom back link:
 <code>/save slug | https://t.me/YourChannel</code>
 
-You can also send media directly to the bot instead of using the backup channel.
-If you do that, the bot will use the local copy it received.
+This keeps the original caption/description format instead of forcing a template.
 
 <b>Commands</b>
 <code>/menu</code>
@@ -150,7 +141,6 @@ def prune_recent_items(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def safe_get_message_html(message) -> str:
-    # Preserve caption/text formatting as closely as possible.
     if getattr(message, "caption", None):
         html = getattr(message, "caption_html_urled", None)
         if html:
@@ -167,7 +157,6 @@ def safe_get_message_html(message) -> str:
 
 
 def guess_display_name_from_html(html_text: str, slug: str) -> str:
-    # Basic HTML tag strip for first-line preview
     plain = re.sub(r"<[^>]+>", "", html_text or "").strip()
     if not plain:
         return slug
@@ -221,7 +210,7 @@ def extract_media_from_message(message) -> Optional[Dict[str, str]]:
 
 def extract_forward_source(message) -> Dict[str, Any]:
     """
-    If admin forwarded a channel post to the bot, try to capture the original source chat/message id.
+    If admin forwarded a channel post to the bot, capture the original source chat/message ID.
     """
     result = {
         "source_chat_id": None,
@@ -244,13 +233,13 @@ def extract_forward_source(message) -> Dict[str, Any]:
 
 def build_local_media_group(product: Dict[str, Any]) -> List[Any]:
     media_items = product.get("media", [])
-    caption_html = product.get("content_html", "")
+    content_html = product.get("content_html", "")
     output = []
 
     for index, item in enumerate(media_items):
         kwargs = {}
-        if index == 0 and caption_html:
-            kwargs["caption"] = caption_html
+        if index == 0 and content_html:
+            kwargs["caption"] = content_html
             kwargs["parse_mode"] = ParseMode.HTML
 
         if item["type"] == "photo":
@@ -335,7 +324,7 @@ def get_group_items_for_reference(
         if item["chat_id"] == chat_id and item.get("media_group_id") == media_group_id
     ]
     items.sort(key=lambda x: x["local_message_id"])
-    return items
+    return items if items else [ref_item]
 
 
 async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: str) -> None:
@@ -347,7 +336,7 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
             chat_id=chat_id,
             text=(
                 "<b>Product not found.</b>\n\n"
-                f'{add_back_link_html(MAIN_MENU_URL)}'
+                f"{add_back_link_html(MAIN_MENU_URL)}"
             ),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -356,7 +345,7 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
 
     back_url = product.get("back_url", MAIN_MENU_URL)
 
-    # Preferred mode: copy directly from the original backup-channel/source messages
+    # Preferred mode: copy directly from the original forwarded source
     source_chat_id = product.get("source_chat_id")
     source_message_ids = product.get("source_message_ids") or []
 
@@ -375,7 +364,6 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
                     message_ids=sorted(source_message_ids),
                 )
 
-            # Optional separate menu link after the copied content
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=add_back_link_html(back_url),
@@ -385,9 +373,9 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
             return
 
         except Exception as e:
-            logger.exception("Source-copy failed for %s: %s", slug, e)
+            logger.exception("Source copy failed for %s: %s", slug, e)
 
-    # Fallback mode: rebuild from stored local file_ids/content
+    # Fallback: rebuild from stored local file_ids/content
     media = product.get("media", [])
     content_html = product.get("content_html", "")
 
@@ -405,9 +393,8 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
             )
             return
         except Exception as e:
-            logger.exception("Fallback media send failed for %s: %s", slug, e)
+            logger.exception("Local media fallback failed for %s: %s", slug, e)
 
-    # Final text fallback
     await context.bot.send_message(
         chat_id=chat_id,
         text=build_local_text_with_back_link(content_html, back_url),
@@ -494,7 +481,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not parsed:
         await message.reply_text(
             (
-                "Use this by replying to a forwarded or sent product message:\n\n"
+                "Use this by replying to a product message:\n\n"
                 "/save slug\n\n"
                 "Optional:\n"
                 "/save slug | https://t.me/YourChannel"
@@ -503,9 +490,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if not message.reply_to_message:
-        await message.reply_text(
-            "Reply to one of the forwarded product messages with /save slug"
-        )
+        await message.reply_text("Reply to a product message with /save slug")
         return
 
     reply = message.reply_to_message
@@ -516,14 +501,13 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     if not ref_item:
-        # Build best-effort single item from the replied message directly
         direct_media = extract_media_from_message(reply)
         direct_html = safe_get_message_html(reply)
         direct_source = extract_forward_source(reply)
 
         if not direct_media and not getattr(reply, "text", None):
             await message.reply_text(
-                "I couldn't use that replied message. Reply to a product media/text message."
+                "I couldn't use that replied message. Reply to a product media or text message."
             )
             return
 
@@ -546,7 +530,6 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     slug = parsed["slug"]
     back_url = parsed["back_url"]
 
-    # Preserve original caption/text exactly as forwarded/sent
     content_html = ""
     for item in grouped_items:
         if item.get("html_text"):
@@ -586,8 +569,11 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     save_products(products)
 
     bot_username = (await context.bot.get_me()).username
-
-    source_note = "Uses backup/source copy mode." if source_chat_id and source_message_ids else "Uses local fallback mode."
+    source_note = (
+        "Uses original source copy mode."
+        if source_chat_id and source_message_ids
+        else "Uses local saved fallback mode."
+    )
 
     await message.reply_text(
         (
@@ -668,15 +654,6 @@ async def capture_admin_content(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     record_recent_item(update, context)
-
-    message = update.effective_message
-    if not message:
-        return
-
-    media = extract_media_from_message(message)
-    if media or getattr(message, "text", None):
-        # Keep this lightweight. No reply spam for every album item.
-        pass
 
 
 # =========================================================
