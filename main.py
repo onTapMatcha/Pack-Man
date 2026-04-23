@@ -55,7 +55,7 @@ DEFAULT_PRODUCTS: Dict[str, Dict[str, Any]] = {}
 WELCOME_TEXT = f"""
 <b>Welcome</b>
 
-Open a product link from the channel to view the saved product.
+Open a product link from the channel to view the saved product, or run /menu to view all products.
 
 <a href="{escape(MAIN_MENU_URL, quote=True)}">Back to Menu</a>
 """.strip()
