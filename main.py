@@ -57,7 +57,7 @@ WELCOME_TEXT = f"""
 
 Open a product link from the channel to view the saved product, or run /menu to view all products.
 
-<a href="{escape(MAIN_MENU_URL, quote=True)}">Back to Channel Frontpage</a> • <a href="tg://resolve?domain={{BOT_USERNAME}}&start=menu">View Full Menu</a>
+<a href="{escape(MAIN_MENU_URL, quote=True)}">Back to Channel Frontpage</a> • <a href="tg://resolve?domain={{BOT_USERNAME}}&start=menu">View Full Priced Menu</a>
 """.strip()
 
 ADMIN_HELP = """
