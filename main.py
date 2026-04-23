@@ -57,7 +57,7 @@ WELCOME_TEXT = f"""
 
 Open a product link from the channel to view the saved product, or run /menu to view all products.
 
-<a href="{escape(MAIN_MENU_URL, quote=True)}">Back to Menu</a>
+<a href="{escape(MAIN_MENU_URL, quote=True)}">Back to Channel Frontpage</a> • <a href="tg://resolve?domain={{BOT_USERNAME}}&start=menu">View Full Menu</a>
 """.strip()
 
 ADMIN_HELP = """
@@ -252,14 +252,19 @@ def build_local_media_group(product: Dict[str, Any]) -> List[Any]:
     return output
 
 
-def add_back_link_html(back_url: str) -> str:
-    return f'<a href="{escape(back_url, quote=True)}">Back to Menu</a>'
+def build_nav_links_html(back_url: str, bot_username: str) -> str:
+    return (
+        f'<a href="{escape(back_url, quote=True)}">Back to Channel Frontpage</a>'
+        f" • "
+        f'<a href="https://t.me/{escape(bot_username)}?start=menu">View Full Menu</a>'
+    )
 
 
-def build_local_text_with_back_link(content_html: str, back_url: str) -> str:
+def build_local_text_with_nav(content_html: str, back_url: str, bot_username: str) -> str:
+    nav_html = build_nav_links_html(back_url, bot_username)
     if content_html:
-        return f"{content_html}\n\n{add_back_link_html(back_url)}"
-    return add_back_link_html(back_url)
+        return f"{content_html}\n\n{nav_html}"
+    return nav_html
 
 
 def record_recent_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -332,11 +337,12 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
     product = products.get(slug)
 
     if not product:
+        bot_username = (await context.bot.get_me()).username
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
                 "<b>Product not found.</b>\n\n"
-                f"{add_back_link_html(MAIN_MENU_URL)}"
+                f"{build_nav_links_html(MAIN_MENU_URL, bot_username)}"
             ),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -344,6 +350,7 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
         return
 
     back_url = product.get("back_url", MAIN_MENU_URL)
+    bot_username = (await context.bot.get_me()).username
 
     # Preferred mode: copy directly from the original forwarded source
     source_chat_id = product.get("source_chat_id")
@@ -366,7 +373,7 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
 
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=add_back_link_html(back_url),
+                text=build_nav_links_html(back_url, bot_username),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -387,7 +394,7 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
             )
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=add_back_link_html(back_url),
+                text=build_nav_links_html(back_url, bot_username),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -397,7 +404,7 @@ async def send_product(chat_id: int, context: ContextTypes.DEFAULT_TYPE, slug: s
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=build_local_text_with_back_link(content_html, back_url),
+        text=build_local_text_with_nav(content_html, back_url, bot_username),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -413,11 +420,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     payload = context.args[0].strip().lower() if context.args else ""
 
+    if payload == "menu":
+        await menu_command(update, context)
+        return
+
     if payload:
         await send_product(update.effective_chat.id, context, payload)
         return
 
-    text = WELCOME_TEXT
+    bot_username = (await context.bot.get_me()).username
+    text = WELCOME_TEXT.replace("{BOT_USERNAME}", bot_username)
     if is_private_chat(update) and is_admin(update):
         text += "\n\n" + ADMIN_HELP
 
@@ -459,7 +471,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             lines.append(f'• <a href="{deep_link}">{display_name}</a>')
 
     lines.append("")
-    lines.append(add_back_link_html(MAIN_MENU_URL))
+    lines.append(build_nav_links_html(MAIN_MENU_URL, bot_username))
 
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
