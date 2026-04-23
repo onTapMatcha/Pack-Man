@@ -256,7 +256,7 @@ def build_nav_links_html(back_url: str, bot_username: str) -> str:
     return (
         f'<a href="{escape(back_url, quote=True)}">Back to Channel Frontpage</a>'
         f" • "
-        f'<a href="https://t.me/{escape(bot_username)}?start=menu">View Full Menu</a>'
+        f'<a href="https://t.me/{escape(bot_username)}?start=menu">View Full Priced Menu</a>'
     )
 
 
